@@ -1,6 +1,0 @@
-msk:
-  brokers: "boot-pt9mstca.c2.kafka-serverless.ap-southeast-1.amazonaws.com:9098"
-  topic: "test-topic"
-  consumer_group: "test-group"
-aws:
-  region: "ap-southeast-1"

@@ -6,44 +6,57 @@ import (
 	"log"
 	"time"
 
-	"github.com/ThuanPhuc27/golang-msk-serverless/internal/config"
-	"github.com/ThuanPhuc27/golang-msk-serverless/pkg/kafka"
-	"github.com/twmb/franz-go/pkg/kgo"
+	"github.com/aws/aws-msk-iam-sasl-signer-go/signer"
+	"github.com/segmentio/kafka-go"
+	"github.com/segmentio/kafka-go/sasl/aws_msk_iam"
+)
+
+const (
+	topic          = "test-topic"
+	broker         = "boot-pt9mstca.c2.kafka-serverless.ap-southeast-1.amazonaws.com:9098" // Thay bằng endpoint thực tế
+	awsRegion      = "ap-southeast-1"                 // Thay bằng region của bạn
+	sessionValidity = 15 * time.Minute                // Thời hạn token IAM
 )
 
 func main() {
-	cfg, err := config.LoadConfig("configs/app.yaml")
+	// 1. Tạo IAM signer
+	iamSigner, err := signer.NewDefaultSigner(sessionValidity)
 	if err != nil {
-		log.Fatalf("Failed to load config: %v", err)
+		log.Fatalf("Failed to create IAM signer: %v", err)
 	}
 
-	log.Printf("Brokers: %s", cfg.MSK.Brokers)
+	// 2. Cấu hình SASL mechanism
+	mechanism := aws_msk_iam.NewMechanism(iamSigner, awsRegion)
 
-	client, err := kafka.NewMSKClient([]string{cfg.MSK.Brokers}, "")
-	if err != nil {
-		log.Fatalf("Failed to create Kafka client: %v", err)
+	// 3. Tạo Kafka writer với IAM authentication
+	writer := &kafka.Writer{
+		Addr:      kafka.TCP(broker),
+		Topic:     topic,
+		Transport: &kafka.Transport{SASL: mechanism},
+		Async:     false, // Đồng bộ để kiểm tra lỗi ngay lập tức
 	}
-	defer client.Close()
 
-	log.Println("Sending 2 messages to Kafka...")
-
-	for i := 1; i <= 2; i++ {
-		record := &kgo.Record{
-			Topic: cfg.MSK.Topic,
-			Value: []byte(fmt.Sprintf("Test message %d - %s", i, time.Now().Format(time.RFC3339))),
+	defer func() {
+		if err := writer.Close(); err != nil {
+			log.Printf("Failed to close writer: %v", err)
 		}
+	}()
 
-		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-		defer cancel()
+	// 4. Gửi message
+	for i := 1; i <= 10; i++ {
+		msg := fmt.Sprintf("Message %d - %s", i, time.Now().Format(time.RFC3339))
+		err := writer.WriteMessages(context.Background(),
+			kafka.Message{
+				Value: []byte(msg),
+			},
+		)
 
-		if err := client.ProduceSync(ctx, record).FirstErr(); err != nil {
-			log.Printf("Failed to produce message %d: %v", i, err)
+		if err != nil {
+			log.Printf("Failed to send message %d: %v", i, err)
 			continue
 		}
 
-		log.Printf("Sent message %d to topic %s", i, cfg.MSK.Topic)
+		log.Printf("Sent message %d: %s", i, msg)
 		time.Sleep(2 * time.Second)
 	}
-
-	log.Println("✅ Finished sending 2 messages. Exiting.")
 }
