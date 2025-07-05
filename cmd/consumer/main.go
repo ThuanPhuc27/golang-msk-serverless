@@ -5,68 +5,132 @@ import (
 	"log"
 	"os"
 	"os/signal"
+	"sync"
 	"syscall"
 	"time"
 
+	"github.com/IBM/sarama"
 	"github.com/aws/aws-msk-iam-sasl-signer-go/signer"
-	"github.com/segmentio/kafka-go"
-	"github.com/segmentio/kafka-go/sasl/aws_msk_iam"
 )
 
 const (
-	topic          = "test-topic"
-	broker         = "boot-pt9mstca.c2.kafka-serverless.ap-southeast-1.amazonaws.com:9098"
-	awsRegion      = "ap-southeast-1"
-	consumerGroup  = "test-consumer-group"
-	sessionValidity = 15 * time.Minute
+	consumerGroupID = "test-consumer-group"
 )
 
-func main() {
-	// 1. Tạo IAM signer
-	iamSigner, err := signer.NewDefaultSigner(sessionValidity)
+var (
+	kafkaBrokers = []string{"boot-pt9mstca.c2.kafka-serverless.ap-southeast-1.amazonaws.com:9098"}
+	awsRegion    = "ap-southeast-1"
+	topic        = "test-topic"
+)
+
+type MSKAccessTokenProvider struct{}
+
+func (m *MSKAccessTokenProvider) Token() (*sarama.AccessToken, error) {
+	token, expiry, err := signer.GenerateAuthToken(context.TODO(), awsRegion)
 	if err != nil {
-		log.Fatalf("Failed to create IAM signer: %v", err)
+		return nil, err
 	}
+	log.Printf("Refreshed MSK IAM token, valid until: %v", expiry)
+	return &sarama.AccessToken{Token: token}, nil
+}
 
-	// 2. Cấu hình Kafka reader
-	reader := kafka.NewReader(kafka.ReaderConfig{
-		Brokers: []string{broker},
-		Topic:   topic,
-		GroupID: consumerGroup,
-		Dialer: &kafka.Dialer{
-			SASLMechanism: aws_msk_iam.NewMechanism(iamSigner, awsRegion),
-		},
-	})
+type Consumer struct {
+	ready    chan bool
+	msgCount int
+}
 
+func (consumer *Consumer) Setup(sarama.ConsumerGroupSession) error {
+	close(consumer.ready)
+	return nil
+}
+
+func (consumer *Consumer) Cleanup(sarama.ConsumerGroupSession) error {
+	return nil
+}
+
+func (consumer *Consumer) ConsumeClaim(session sarama.ConsumerGroupSession, claim sarama.ConsumerGroupClaim) error {
+	for message := range claim.Messages() {
+		consumer.msgCount++
+		log.Printf("[Message #%d] Topic: %s | Partition: %d | Offset: %d | Key: %s | Value: %s",
+			consumer.msgCount,
+			message.Topic,
+			message.Partition,
+			message.Offset,
+			string(message.Key),
+			string(message.Value))
+		session.MarkMessage(message, "")
+	}
+	return nil
+}
+
+func createConsumer() (sarama.ConsumerGroup, error) {
+	config := sarama.NewConfig()
+	config.Version = sarama.V2_5_0_0
+	config.Net.SASL.Enable = true
+	config.Net.SASL.Mechanism = sarama.SASLTypeOAuth
+	config.Net.SASL.TokenProvider = &MSKAccessTokenProvider{}
+	config.Net.TLS.Enable = true
+	config.Consumer.Return.Errors = true
+	config.Consumer.Offsets.Initial = sarama.OffsetOldest
+
+	consumer, err := sarama.NewConsumerGroup(kafkaBrokers, consumerGroupID, config)
+	if err != nil {
+		return nil, err
+	}
+	return consumer, nil
+}
+
+func main() {
+	log.Println("Starting MSK Consumer for topic:", topic)
+	log.Println("Brokers:", kafkaBrokers)
+	log.Println("Region:", awsRegion)
+	log.Println("Consumer Group:", consumerGroupID)
+
+	consumer, err := createConsumer()
+	if err != nil {
+		log.Fatalf("Failed to create consumer: %v", err)
+	}
 	defer func() {
-		if err := reader.Close(); err != nil {
-			log.Printf("Failed to close reader: %v", err)
+		if err := consumer.Close(); err != nil {
+			log.Printf("Error closing consumer: %v", err)
 		}
 	}()
 
-	// 3. Xử lý tín hiệu dừng
-	sigchan := make(chan os.Signal, 1)
-	signal.Notify(sigchan, syscall.SIGINT, syscall.SIGTERM)
+	ctx, cancel := context.WithCancel(context.Background())
+	wg := &sync.WaitGroup{}
+	wg.Add(1)
 
-	log.Println("Consumer started. Press Ctrl+C to stop...")
-
-	// 4. Nhận message
-	for {
-		select {
-		case <-sigchan:
-			log.Println("Shutting down consumer...")
-			return
-		default:
-			msg, err := reader.ReadMessage(context.Background())
-			if err != nil {
-				log.Printf("Error reading message: %v", err)
-				continue
-			}
-
-			log.Printf(
-				"Received message: Topic=%s Partition=%d Offset=%d Key=%s Value=%s\n",
-				msg.Topic, msg.Partition, msg.Offset, string(msg.Key), string(msg.Value),
-			)
-		}
+	handler := &Consumer{
+		ready: make(chan bool),
 	}
+
+	go func() {
+		defer wg.Done()
+		for {
+			if err := consumer.Consume(ctx, []string{topic}, handler); err != nil {
+				log.Printf("Consume error: %v", err)
+				time.Sleep(5 * time.Second)
+			}
+			if ctx.Err() != nil {
+				return
+			}
+			handler.ready = make(chan bool)
+		}
+	}()
+
+	<-handler.ready
+	log.Println("Consumer successfully initialized and running")
+
+	sigterm := make(chan os.Signal, 1)
+	signal.Notify(sigterm, os.Interrupt, syscall.SIGTERM)
+
+	select {
+	case <-sigterm:
+		log.Println("Received shutdown signal, initiating graceful shutdown...")
+	case <-ctx.Done():
+		log.Println("Context cancelled")
+	}
+	cancel()
+	wg.Wait()
+	log.Println("Consumer shutdown completed")
 }
